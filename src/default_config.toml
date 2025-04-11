@@ -1,0 +1,15 @@
+# The bind address of the WebSocket used for WebRTC signaling
+websocket_address = "0.0.0.0:8085"
+# The bind addresses of the UDP sockets used to receive camera RTP streams
+camera_addresses = [
+    "0.0.0.0:1181",
+    "0.0.0.0:1182",
+    "0.0.0.0:1183",
+    "0.0.0.0:1184",
+    "0.0.0.0:1185",
+    "0.0.0.0:1186",
+    "0.0.0.0:1187",
+    "0.0.0.0:1188",
+]
+# Log level filter. Select from [Off, Error, Warn, Info, Debug, Trace] (from log::LevelFilter)
+log_level = "Info"
