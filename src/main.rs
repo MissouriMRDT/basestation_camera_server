@@ -16,11 +16,12 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio_tungstenite::WebSocketStream;
 use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::media_engine::{MediaEngine, MIME_TYPE_VP8};
+use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::track::track_local::track_local_static_rtp::TrackLocalStaticRTP;
 use webrtc::track::track_local::TrackLocalWriter;
 
-/// Holds configuration values read from config.toml.
+/// Holds configuration values read from config.toml
 #[derive(serde::Deserialize, Clone)]
 struct Config {
     websocket_address: String,
@@ -84,13 +85,13 @@ async fn main() -> Result<()> {
         .filter(None, config.log_level)
         .init();
 
-    // Create tracks that we send video back to browser on.
+    // Create tracks that we send video back to browser on
     let video_tracks: Arc<Vec<Arc<TrackLocalStaticRTP>>> = Arc::new(
         config
             .camera_addresses
             .iter()
             .enumerate()
-            .map(|(i, camera_address)| {
+            .map(|(i, _)| {
                 Arc::new(TrackLocalStaticRTP::new(
                     webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability {
                         mime_type: MIME_TYPE_VP8.to_owned(),
@@ -103,8 +104,8 @@ async fn main() -> Result<()> {
             .collect(),
     );
 
-    // Open a UDP Listener for RTP Packets.
-    // Read RTP packets forever and send them to the WebRTC Client.
+    // Open a UDP Listener for RTP Packets
+    // Read RTP packets forever and send them to the WebRTC Client
     for (camera_address, video_track) in std::iter::zip(
         config.camera_addresses.iter().map(|a| a.clone()),
         video_tracks.iter().map(|v| v.clone()),
@@ -166,14 +167,14 @@ async fn ws_handler(
         .await
         .context("Websocket handshake failed")?;
 
-    // Wait for a SDP to be received.
+    // Wait for a SDP to be received
     debug!("[WS {addr}] Waiting for remote session description.");
     let offer = read_offer(addr, &mut ws_stream)
         .await
         .context("Failed to read and decode remote session description")?;
     debug!("[WS {addr}] Received remote session description.");
 
-    // Create a MediaEngine object to configure the supported codec.
+    // Create a MediaEngine object to configure the supported codec
     let mut m = MediaEngine::default();
 
     m.register_default_codecs()
@@ -185,23 +186,23 @@ async fn ws_handler(
     // for each PeerConnection.
     let registry = webrtc::interceptor::registry::Registry::new();
 
-    // Use the default set of Interceptors.
+    // Use the default set of Interceptors
     let registry = register_default_interceptors(registry, &mut m)
         .context("Failed to register default interceptors")?;
 
-    // Create the API object with the MediaEngine.
+    // Create the API object with the MediaEngine
     let api = webrtc::api::APIBuilder::new()
         .with_media_engine(m)
         .with_interceptor_registry(registry)
         .build();
 
-    // Prepare the configuration.
+    // Prepare the configuration
     let config = webrtc::peer_connection::configuration::RTCConfiguration {
         ice_servers: vec![],
         ..Default::default()
     };
 
-    // Create a new RTCPeerConnection.
+    // Create a new RTCPeerConnection
     debug!("[WS {addr}] Creating RTCPeerConnection.");
     let peer_connection = Arc::new(
         api.new_peer_connection(config)
@@ -209,7 +210,8 @@ async fn ws_handler(
             .context("Failed to create a new RTCPeerConnection")?,
     );
 
-    // Add this newly created track to the PeerConnection.
+    // Add this newly created track to the PeerConnection
+    let (running_tx, running_rx) = tokio::sync::watch::channel(true);
     for (i, video_track) in <Vec<Arc<TrackLocalStaticRTP>> as Clone>::clone(&video_tracks)
         .into_iter()
         .enumerate()
@@ -220,28 +222,64 @@ async fn ws_handler(
             .await
             .with_context(|| format!("Failed to add track {i} to RTCPeerConnection"))?;
 
-        // Read incoming RTCP packets.
+        // Read incoming RTCP packets
+        let mut running_rx2 = running_rx.clone();
         tokio::spawn(async move {
             debug!("[WS {addr} TRACK {i}] Starting RTCP listener.");
             let mut rtcp_buf = vec![0u8; 1500];
-            while let Ok((_, _)) = rtp_sender.read(&mut rtcp_buf).await {}
+            loop {
+                tokio::select! {
+                    Err(err) = rtp_sender.read(&mut rtcp_buf) => {
+                        warn!("[WS {addr} TRACK {i}] Error reading RTCP listener: {err}.");
+                        break;
+                    },
+                    _ = running_rx2.wait_for(|running| *running == false) => {
+                        debug!("[WS {addr} TRACK {i}] Received stop signal.");
+                        break;
+                    },
+                }
+            }
+            debug!("[WS {addr} TRACK {i}] Stopping RTCP listener.");
+            if let Err(err) = rtp_sender.stop().await {
+                warn!("[WS {addr} TRACK {i}] Error stopping RTCP listener: {err}.");
+            };
             debug!("[WS {addr} TRACK {i}] Stopped RTCP listener.");
             Result::<()>::Ok(())
         });
     }
 
-    // Set the handler for ICE connection state.
+    // Set the handler for ICE connection state
     peer_connection.on_ice_connection_state_change(Box::new(
         move |connection_state: webrtc::ice_transport::ice_connection_state::RTCIceConnectionState| {
-            debug!("[WS {addr}] ICE connection state has changed {connection_state}.");
+            debug!("[WS {addr}] ICE connection state has changed: {connection_state}.");
             Box::pin(async {})
         },
     ));
 
-    // Set the handler for Peer connection state.
+    // Spawn closer
+    let mut running_rx2 = running_rx.clone();
+    let peer_connection2 = peer_connection.clone();
+    tokio::spawn(async move {
+        let _ = running_rx2.wait_for(|running| *running == false).await;
+        debug!("[PC {addr}] Received stop signal.");
+        if let Err(err) = peer_connection2.close().await {
+            warn!("[PC {addr}] Error closing peer connection: {err}.");
+        } else {
+            debug!("[PC {addr}] Closed peer connection.");
+        }
+    });
+
+    // Set the handler for Peer connection state
     peer_connection.on_peer_connection_state_change(Box::new(
-        move |s: webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState| {
-            debug!("[WS {addr}] Peer connection state has changed: {s}.");
+        move |connection_state: RTCPeerConnectionState| {
+            debug!("[WS {addr}] Peer connection state has changed: {connection_state}.");
+            if connection_state == RTCPeerConnectionState::Disconnected {
+                // Send stop signal
+                debug!("[WS {addr}] Stopping RTCP listeners.");
+                if let Err(err) = running_tx.send(false) {
+                    warn!("[WS {addr}] Error sending stop signal: {err}.");
+                }
+            }
             Box::pin(async {})
         },
     ));
@@ -277,7 +315,7 @@ async fn ws_handler(
     debug!("[WS {addr}] Waiting for gathering to complete.");
     let _ = gather_complete.recv().await;
 
-    // Send local session description.
+    // Send local session description
     debug!("[WS {addr}] Sending local session description.");
     write_offer(addr, &mut ws_stream, &peer_connection)
         .await
@@ -290,13 +328,13 @@ async fn read_offer(
     addr: std::net::SocketAddr,
     stream: &mut WebSocketStream<TcpStream>,
 ) -> Result<RTCSessionDescription> {
-    // Read base 64.
+    // Read base 64
     let Some(next) = stream.next().await else {
         return Err(anyhow!("No message"));
     };
     let b64 = next?.into_data();
 
-    // Decode into json.
+    // Decode into json
     let json = BASE64_STANDARD
         .decode(b64)
         .context("Failed to decode base 64")?;
@@ -305,7 +343,7 @@ async fn read_offer(
         std::str::from_utf8(&json).unwrap_or_default()
     );
 
-    // Deserialize into RTCSessionDescription.
+    // Deserialize into RTCSessionDescription
     Ok(serde_json::from_slice::<RTCSessionDescription>(&json)?)
 }
 
@@ -314,7 +352,7 @@ async fn write_offer(
     stream: &mut WebSocketStream<TcpStream>,
     peer_connection: &Arc<webrtc::peer_connection::RTCPeerConnection>,
 ) -> Result<()> {
-    // Serialize into json.
+    // Serialize into json
     let local_description = peer_connection
         .local_description()
         .await
@@ -325,10 +363,10 @@ async fn write_offer(
         std::str::from_utf8(&json).unwrap_or_default()
     );
 
-    // Encode into base 64.
+    // Encode into base 64
     let b64 = BASE64_STANDARD.encode(&json);
 
-    // Write base 64.
+    // Write base 64
     stream
         .send(tokio_tungstenite::tungstenite::Message::Text(b64.into()))
         .await
