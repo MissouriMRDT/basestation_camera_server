@@ -47,5 +47,4 @@ for i in range(STREAMS):
     ])
     # fmt: on
 
-print("\n".join(arguments))
 subprocess.run(arguments)
