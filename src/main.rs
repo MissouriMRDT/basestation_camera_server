@@ -12,7 +12,11 @@ use log::debug;
 use log::error;
 use log::info;
 use log::warn;
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::CertificateDer;
+use rustls::pki_types::PrivateKeyDer;
+use tokio::net::{TcpListener, UdpSocket};
+use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::WebSocketStream;
 use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::media_engine::{MediaEngine, MIME_TYPE_VP8};
@@ -25,6 +29,9 @@ use webrtc::track::track_local::TrackLocalWriter;
 #[derive(serde::Deserialize, Clone)]
 struct Config {
     websocket_address: String,
+    webssocket_address: String,
+    cert_file: String,
+    private_key_file: String,
     camera_addresses: Vec<String>,
     #[serde(deserialize_with = "level_from_str")]
     log_level: log::LevelFilter,
@@ -131,48 +138,117 @@ async fn main() -> Result<()> {
     }
 
     info!("[WS] Starting on {}.", config.websocket_address);
-    let listener = TcpListener::bind(&config.websocket_address)
+    let ws_listener = TcpListener::bind(&config.websocket_address)
         .await
         .with_context(|| format!("[WS] Failed to bind to {}", &config.websocket_address))?;
-    tokio::select! {
-        _ = async {loop {
-            match listener.accept().await {
-                Err(err) => warn!("[WS] Connection error: {err}."),
-                Ok((stream, addr)) => {
-                    info!("[WS {addr}] Connected.");
-                    let video_tracks2 = video_tracks.clone();
-                    tokio::spawn(async move {
-                        match ws_handler(addr, stream, video_tracks2).await {
-                            Err(err) => warn!("[WS {addr}] {err:?}."),
-                            Ok(_) => info!("[WS {addr}] Disconnected."),
-                        };
-                    });
+
+    if config.webssocket_address.len() > 0 {
+        rustls::crypto::aws_lc_rs::default_provider()
+            .install_default()
+            .expect("[WSS] Failed to install crypto provider.");
+        info!("[WSS] Starting on {}.", config.webssocket_address);
+        let certs = CertificateDer::pem_file_iter(config.cert_file)
+            .expect("[WSS] Error opening certificate file.")
+            .map(|cert| cert.expect("[WSS] Error loading DER certificate."))
+            .collect();
+        let private_key = PrivateKeyDer::from_pem_file(config.private_key_file)
+            .expect("[WSS] Error opening private key file.");
+        let tls_server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, private_key)
+            .expect("[WSS] Error configuring server.");
+        let tls_acceptor = TlsAcceptor::from(Arc::new(tls_server_config));
+        let wss_listener = TcpListener::bind(&config.webssocket_address)
+            .await
+            .with_context(|| format!("[WSS] Failed to bind to {}", &config.webssocket_address))?;
+
+        tokio::select! {
+            _ = async {loop {
+                match ws_listener.accept().await {
+                    Err(err) => warn!("[WS] Connection error: {err}."),
+                    Ok((stream, addr)) => {
+                        info!("[WS {addr}] Connected.");
+                        let video_tracks2 = video_tracks.clone();
+                        tokio::spawn(async move {
+                            match ws_handler(false,
+                                addr, stream, video_tracks2).await {
+                                Err(err) => warn!("[WS {addr}] {err:?}."),
+                                Ok(_) => info!("[WS {addr}] Disconnected."),
+                            };
+                        });
+                    }
                 }
-            }
-        }} => {}
-        _ = tokio::signal::ctrl_c() => {
-            info!("Shutting down.")
-        },
-    };
+            }} => {}
+            _ = async {loop {
+                match wss_listener.accept().await {
+                    Err(err) => warn!("[WSS] Connection error: {err}."),
+                    Ok((tcp_stream, addr)) => {
+                        info!("[WSS {addr}] Connected.");
+                        let tls_stream = match tls_acceptor.accept(tcp_stream).await {
+                            Err(err) => { warn!("[WSS {addr}] {err:?}."); continue; }
+                            Ok(t) => t
+                        };
+                        let video_tracks2 = video_tracks.clone();
+                        tokio::spawn(async move {
+                            match ws_handler(true, addr, tls_stream, video_tracks2).await {
+                                Err(err) => warn!("[WS {addr}] {err:?}."),
+                                Ok(_) => info!("[WS {addr}] Disconnected."),
+                            };
+                        });
+                    }
+                }
+            }} => {}
+            _ = tokio::signal::ctrl_c() => {
+                info!("Shutting down.")
+            },
+        };
+    } else {
+        tokio::select! {
+            _ = async {loop {
+                match ws_listener.accept().await {
+                    Err(err) => warn!("[WS] Connection error: {err}."),
+                    Ok((stream, addr)) => {
+                        info!("[WS {addr}] Connected.");
+                        let video_tracks2 = video_tracks.clone();
+                        tokio::spawn(async move {
+                            match ws_handler(false,
+                                addr, stream, video_tracks2).await {
+                                Err(err) => warn!("[WS {addr}] {err:?}."),
+                                Ok(_) => info!("[WS {addr}] Disconnected."),
+                            };
+                        });
+                    }
+                }
+            }} => {}
+            _ = tokio::signal::ctrl_c() => {
+                info!("Shutting down.")
+            },
+        };
+    }
 
     Ok(())
 }
 
-async fn ws_handler(
+async fn ws_handler<S>(
+    secure: bool,
     addr: std::net::SocketAddr,
-    stream: TcpStream,
+    stream: S,
     video_tracks: Arc<Vec<Arc<TrackLocalStaticRTP>>>,
-) -> Result<()> {
+) -> Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let name = if secure { "WSS" } else { "WS" };
     let mut ws_stream = tokio_tungstenite::accept_async(stream)
         .await
         .context("Websocket handshake failed")?;
 
     // Wait for a SDP to be received
-    debug!("[WS {addr}] Waiting for remote session description.");
+    debug!("[{name} {addr}] Waiting for remote session description.");
     let offer = read_offer(addr, &mut ws_stream)
         .await
         .context("Failed to read and decode remote session description")?;
-    debug!("[WS {addr}] Received remote session description.");
+    debug!("[{name} {addr}] Received remote session description.");
 
     // Create a MediaEngine object to configure the supported codec
     let mut m = MediaEngine::default();
@@ -203,7 +279,7 @@ async fn ws_handler(
     };
 
     // Create a new RTCPeerConnection
-    debug!("[WS {addr}] Creating RTCPeerConnection.");
+    debug!("[{name} {addr}] Creating RTCPeerConnection.");
     let peer_connection = Arc::new(
         api.new_peer_connection(config)
             .await
@@ -216,7 +292,7 @@ async fn ws_handler(
         .into_iter()
         .enumerate()
     {
-        debug!("[WS {addr} TRACK {i}] Adding track to RTCPeerConnection.");
+        debug!("[{name} {addr} TRACK {i}] Adding track to RTCPeerConnection.");
         let rtp_sender = peer_connection
             .add_track(video_track)
             .await
@@ -225,25 +301,25 @@ async fn ws_handler(
         // Read incoming RTCP packets
         let mut running_rx2 = running_rx.clone();
         tokio::spawn(async move {
-            debug!("[WS {addr} TRACK {i}] Starting RTCP listener.");
+            debug!("[{name} {addr} TRACK {i}] Starting RTCP listener.");
             let mut rtcp_buf = vec![0u8; 1500];
             loop {
                 tokio::select! {
                     Err(err) = rtp_sender.read(&mut rtcp_buf) => {
-                        warn!("[WS {addr} TRACK {i}] Error reading RTCP listener: {err}.");
+                        warn!("[{name} {addr} TRACK {i}] Error reading RTCP listener: {err}.");
                         break;
                     },
                     _ = running_rx2.wait_for(|running| *running == false) => {
-                        debug!("[WS {addr} TRACK {i}] Received stop signal.");
+                        debug!("[{name} {addr} TRACK {i}] Received stop signal.");
                         break;
                     },
                 }
             }
-            debug!("[WS {addr} TRACK {i}] Stopping RTCP listener.");
+            debug!("[{name} {addr} TRACK {i}] Stopping RTCP listener.");
             if let Err(err) = rtp_sender.stop().await {
                 warn!("[WS {addr} TRACK {i}] Error stopping RTCP listener: {err}.");
             };
-            debug!("[WS {addr} TRACK {i}] Stopped RTCP listener.");
+            debug!("[{name} {addr} TRACK {i}] Stopped RTCP listener.");
             Result::<()>::Ok(())
         });
     }
@@ -251,7 +327,7 @@ async fn ws_handler(
     // Set the handler for ICE connection state
     peer_connection.on_ice_connection_state_change(Box::new(
         move |connection_state: webrtc::ice_transport::ice_connection_state::RTCIceConnectionState| {
-            debug!("[WS {addr}] ICE connection state has changed: {connection_state}.");
+            debug!("[{name} {addr}] ICE connection state has changed: {connection_state}.");
             Box::pin(async {})
         },
     ));
@@ -261,23 +337,23 @@ async fn ws_handler(
     let peer_connection2 = peer_connection.clone();
     tokio::spawn(async move {
         let _ = running_rx2.wait_for(|running| *running == false).await;
-        debug!("[PC {addr}] Received stop signal.");
+        debug!("[{name} PC {addr}] Received stop signal.");
         if let Err(err) = peer_connection2.close().await {
-            warn!("[PC {addr}] Error closing peer connection: {err}.");
+            warn!("[{name} PC {addr}] Error closing peer connection: {err}.");
         } else {
-            debug!("[PC {addr}] Closed peer connection.");
+            debug!("[{name} PC {addr}] Closed peer connection.");
         }
     });
 
     // Set the handler for Peer connection state
     peer_connection.on_peer_connection_state_change(Box::new(
         move |connection_state: RTCPeerConnectionState| {
-            debug!("[WS {addr}] Peer connection state has changed: {connection_state}.");
+            debug!("[{name} {addr}] Peer connection state has changed: {connection_state}.");
             if connection_state == RTCPeerConnectionState::Disconnected {
                 // Send stop signal
-                debug!("[WS {addr}] Stopping RTCP listeners.");
+                debug!("[{name} {addr}] Stopping RTCP listeners.");
                 if let Err(err) = running_tx.send(false) {
-                    warn!("[WS {addr}] Error sending stop signal: {err}.");
+                    warn!("[{name} {addr}] Error sending stop signal: {err}.");
                 }
             }
             Box::pin(async {})
@@ -285,25 +361,25 @@ async fn ws_handler(
     ));
 
     // Set the remote SessionDescription
-    debug!("[WS {addr}] Setting remote session description.");
+    debug!("[{name} {addr}] Setting remote session description.");
     peer_connection
         .set_remote_description(offer)
         .await
         .context("Failed to set remote session description")?;
 
     // Create an answer
-    debug!("[WS {addr}] Creating session description answer.");
+    debug!("[{name} {addr}] Creating session description answer.");
     let answer = peer_connection
         .create_answer(None)
         .await
         .context("Failed to create session description answer")?;
 
     // Create channel that is blocked until ICE Gathering is complete
-    debug!("[WS {addr}] Creating gathering waiter.");
+    debug!("[{name} {addr}] Creating gathering waiter.");
     let mut gather_complete = peer_connection.gathering_complete_promise().await;
 
     // Sets the LocalDescription, and starts our UDP listeners
-    debug!("[WS {addr}] Setting local session description.");
+    debug!("[{name} {addr}] Setting local session description.");
     peer_connection
         .set_local_description(answer)
         .await
@@ -312,11 +388,11 @@ async fn ws_handler(
     // Block until ICE Gathering is complete, disabling trickle ICE
     // we do this because we only can exchange one signaling message
     // in a production application you should exchange ICE Candidates via OnICECandidate
-    debug!("[WS {addr}] Waiting for gathering to complete.");
+    debug!("[{name} {addr}] Waiting for gathering to complete.");
     let _ = gather_complete.recv().await;
 
     // Send local session description
-    debug!("[WS {addr}] Sending local session description.");
+    debug!("[{name} {addr}] Sending local session description.");
     write_offer(addr, &mut ws_stream, &peer_connection)
         .await
         .context("Failed to send local session description")?;
@@ -324,10 +400,13 @@ async fn ws_handler(
     Ok(())
 }
 
-async fn read_offer(
+async fn read_offer<S>(
     addr: std::net::SocketAddr,
-    stream: &mut WebSocketStream<TcpStream>,
-) -> Result<RTCSessionDescription> {
+    stream: &mut WebSocketStream<S>,
+) -> Result<RTCSessionDescription>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     // Read base 64
     let Some(next) = stream.next().await else {
         return Err(anyhow!("No message"));
@@ -347,11 +426,14 @@ async fn read_offer(
     Ok(serde_json::from_slice::<RTCSessionDescription>(&json)?)
 }
 
-async fn write_offer(
+async fn write_offer<S>(
     addr: std::net::SocketAddr,
-    stream: &mut WebSocketStream<TcpStream>,
+    stream: &mut WebSocketStream<S>,
     peer_connection: &Arc<webrtc::peer_connection::RTCPeerConnection>,
-) -> Result<()> {
+) -> Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     // Serialize into json
     let local_description = peer_connection
         .local_description()

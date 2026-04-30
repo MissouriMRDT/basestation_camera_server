@@ -1,5 +1,12 @@
 # The bind address of the WebSocket used for WebRTC signaling
 websocket_address = "0.0.0.0:8085"
+# The bind address of the Secure WebSocket used for WebRTC signaling
+# Set to an empty string to disable Secure WebSocket
+webssocket_address = "0.0.0.0:8086"
+# DER Certificate for Secure WebSocket
+cert_file = "cert.crt"
+# Private Key for Secure WebSocket
+private_key_file = "cert.key"
 # The bind addresses of the UDP sockets used to receive camera RTP streams
 camera_addresses = [
     "0.0.0.0:8100",
