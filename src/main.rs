@@ -6,6 +6,8 @@ use anyhow::Context;
 use anyhow::Result;
 use base64::prelude::BASE64_STANDARD;
 use base64::Engine;
+use byteorder::BigEndian;
+use byteorder::ByteOrder;
 use futures_util::stream::StreamExt;
 use futures_util::SinkExt;
 use log::debug;
@@ -35,6 +37,7 @@ struct Config {
     camera_addresses: Vec<String>,
     #[serde(deserialize_with = "level_from_str")]
     log_level: log::LevelFilter,
+    rewrite_rtp_header: bool,
 }
 
 fn level_from_str<'de, D>(deserializer: D) -> Result<log::LevelFilter, D::Error>
@@ -113,8 +116,12 @@ async fn main() -> Result<()> {
 
     // Open a UDP Listener for RTP Packets
     // Read RTP packets forever and send them to the WebRTC Client
-    for (camera_address, video_track) in std::iter::zip(
-        config.camera_addresses.iter().map(|a| a.clone()),
+    for ((i, camera_address), video_track) in std::iter::zip(
+        config
+            .camera_addresses
+            .iter()
+            .map(|a| a.clone())
+            .enumerate(),
         video_tracks.iter().map(|v| v.clone()),
     ) {
         tokio::spawn(async move {
@@ -126,11 +133,42 @@ async fn main() -> Result<()> {
                 }
                 Ok(listener) => listener,
             };
-            let mut inbound_rtp_packet = vec![0u8; 1600]; // UDP MTU
-            while let Ok((n, _)) = listener.recv_from(&mut inbound_rtp_packet).await {
-                if let Err(err) = video_track.write(&inbound_rtp_packet[..n]).await {
-                    error!("[RTP {camera_address}] Error writing to video track: {err}.");
-                    return;
+            let mut inbound_rtp_packet = vec![0u8; 2000]; // UDP MTU
+
+            if config.rewrite_rtp_header {
+                let mut last_in_timestamp: u32 = 0;
+                let mut out_seq: u16 = 0;
+                let mut out_timestamp: u32 = 0;
+                let mut last_ssrc: u32 = 0;
+                let out_ssrc: u32 = i as u32; // synchronization source identifier
+                while let Ok((n, _)) = listener.recv_from(&mut inbound_rtp_packet).await {
+                    // Rewrite sequence number, timestamp, and synchronization source identifier
+                    let in_ssrc = BigEndian::read_u32(&inbound_rtp_packet[8..12]);
+                    let in_timestamp = BigEndian::read_u32(&inbound_rtp_packet[4..8]);
+
+                    out_seq += 1;
+                    if in_ssrc == last_ssrc {
+                        out_timestamp = out_timestamp
+                            .wrapping_add(in_timestamp.wrapping_sub(last_in_timestamp));
+                    }
+                    last_ssrc = in_ssrc;
+                    last_in_timestamp = in_timestamp;
+
+                    BigEndian::write_u16(&mut inbound_rtp_packet[2..4], out_seq);
+                    BigEndian::write_u32(&mut inbound_rtp_packet[4..8], out_timestamp);
+                    BigEndian::write_u32(&mut inbound_rtp_packet[8..12], out_ssrc);
+
+                    if let Err(err) = video_track.write(&inbound_rtp_packet[..n]).await {
+                        error!("[RTP {camera_address}] Error writing to video track: {err}.");
+                        return;
+                    }
+                }
+            } else {
+                while let Ok((n, _)) = listener.recv_from(&mut inbound_rtp_packet).await {
+                    if let Err(err) = video_track.write(&inbound_rtp_packet[..n]).await {
+                        error!("[RTP {camera_address}] Error writing to video track: {err}.");
+                        return;
+                    }
                 }
             }
             info!("[RTP {camera_address}] Stopped.");
@@ -302,7 +340,7 @@ where
         let mut running_rx2 = running_rx.clone();
         tokio::spawn(async move {
             debug!("[{name} {addr} TRACK {i}] Starting RTCP listener.");
-            let mut rtcp_buf = vec![0u8; 1500];
+            let mut rtcp_buf = vec![0u8; 2000];
             loop {
                 tokio::select! {
                     Err(err) = rtp_sender.read(&mut rtcp_buf) => {

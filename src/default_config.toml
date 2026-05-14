@@ -20,3 +20,5 @@ camera_addresses = [
 ]
 # Log level filter. Select from [Off, Error, Warn, Info, Debug, Trace] (from log::LevelFilter)
 log_level = "Debug"
+# Rewrite sequence number, timestamp, and synchronization source identifier so clients don't need to reconnect when any stream restarts
+rewrite_rtp_header = true

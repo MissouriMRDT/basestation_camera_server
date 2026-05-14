@@ -261,6 +261,7 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64",
+ "byteorder",
  "chrono",
  "env_logger",
  "futures-util",
